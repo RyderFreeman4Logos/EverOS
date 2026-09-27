@@ -510,10 +510,12 @@ class LanceDBSettings(BaseModel):
       indexes) or if you hit a tighter ``ulimit -n`` (containers / dev
       boxes).
 
-      Note: the *metadata* cache (``metadata_cache_size_bytes``) is
-      **not** exposed — experiment showed it caches in-memory parsed
-      manifests / fragment stats with zero impact on FD count; leaving
-      it unbounded (lancedb default) is fine.
+      Note: the *metadata* cache is disabled in the connection factory.
+      With LanceDB 0.34.0, an unbounded metadata cache retained deleted
+      IVF_FLAT index files despite the 16 MB index-cache bound: eight
+      search/replace/cleanup cycles held 1,3,...,15 deleted .idx FDs.
+      Setting metadata_cache_size_bytes=0 released every deleted index
+      FD in the same experiment while indexed searches still succeeded.
     """
 
     read_consistency_seconds: float | None = None
