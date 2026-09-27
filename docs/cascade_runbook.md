@@ -288,14 +288,14 @@ LRU eviction inside the cache (or a connection close) actually closes
 the FDs.
 
 Fix (already wired in `LanceDBSettings.index_cache_size_bytes` —
-default 16 MB, ~290 FD ceiling): see
-[Tuning knobs § LanceDB index cache](#lancedb-index-cache-index_cache_size_bytes)
-for the sizing table and the env-var override path.
+**disabled by default**): see
+[configuration.md](configuration.md) for the opt-in override. A positive
+cache size is an explicit latency/FD trade-off and is not safe as the
+long-running daemon default.
 
 If you have already hit EMFILE in a running process, the cleanest
-recovery is a daemon restart — the open connection closes, every FD
-is released, and the next start comes up with the capped Session in
-place.
+recovery is a daemon restart — the open connection closes, every FD is
+released, and the next start comes up with the cache disabled.
 
 ## Tuning knobs
 
@@ -319,46 +319,18 @@ operator override will surface there.
 ### LanceDB index cache (`index_cache_size_bytes`)
 
 Lives in `LanceDBSettings`; overridable via the
-`EVEROS_LANCEDB__INDEX_CACHE_SIZE_BYTES` environment variable. This
-is the only knob that bounds the steady-state file-descriptor count
-of a long-running EverOS daemon — see
-[Recovery paths § FD exhaustion](#fd-exhaustion-os-error-24--emfile)
-for why nothing else (prune, rebuild, `drop_index`) helps.
+`EVEROS_LANCEDB__INDEX_CACHE_SIZE_BYTES` environment variable. The default
+is `0`, which disables the index cache and releases readers for replaced
+FTS/vector indexes immediately. This is the safe setting for a long-running
+EverOS daemon because any positive cache size can retain deleted
+`part_N_invert.lance` readers until eviction.
 
-Measured cap → FD ceiling (30 add+optimize cycles + 100-query stress
-on the real `Episode` schema):
+Use a positive value only after measuring query latency and FD usage for the
+specific workload. It trades lower cache-miss latency for retained index
+readers and therefore higher FD pressure.
 
-| Cap | FD ceiling | Query latency (p50) | Safe under `ulimit -n` |
-|---|---|---|---|
-| `2 MB` | ~45 | ~5 ms | macOS default 256 (5× headroom) |
-| `4 MB` | ~52 | ~3 ms | macOS default 256 |
-| `8 MB` | ~140 | ~2.4 ms | macOS default 256 (1.8× headroom) |
-| **`16 MB`** (default) | **~290** | **~2.3 ms** | **Linux default 1024 (3.5× headroom); macOS needs `ulimit -n 1024`** |
-| `32 MB` | ~630 | ~1.4 ms | Linux default 1024 (1.6× headroom) |
-| `unbounded` | grows forever | ~1.3 ms | NEVER use in a daemon |
-
-EverOS's measured steady-state working set after a `rebuild_indexes`
-cycle is roughly **50-100 readers / 3-6 MB resident** (5 tables × ~7
-BM25 columns × ~10 `part_N` reader entries each), so the 16 MB default
-provides ~3× headroom for burst traffic and stale-but-not-yet-evicted
-readers.
-
-When to override:
-
-- **Tight `ulimit -n` environments** (containers; macOS dev boxes
-  that haven't bumped the default 256) → drop to `4 MB` or `8 MB`.
-  Query latency increases by ~1-3 ms but correctness is unaffected.
-- **Larger working sets** (many more tables or much wider FTS
-  indexes than the default schema set) → bump to `32-64 MB`. Verify
-  your platform's `ulimit -n` covers the corresponding FD ceiling
-  with at least 2× headroom.
-- **Diagnostic-only**: set to a tiny value (e.g. `1 MB`) to
-  *force* LRU thrashing and reproduce cache-miss latency in tests.
-
-Do **not** set `metadata_cache_size_bytes` — it is intentionally left
-at LanceDB's default (unbounded) because the metadata cache holds
-parsed manifests / fragment stats and has zero effect on FD count;
-capping it just thrashes parsing work without solving anything.
+The metadata cache is also disabled in the connection factory; disabling it
+alone does not release inverted-index readers held by the index cache.
 
 ## Concurrency
 

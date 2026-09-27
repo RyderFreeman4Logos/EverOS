@@ -7,8 +7,9 @@ is a thin wrapper that:
     1. ensures the lancedb root directory exists
     2. converts ``LanceDBSettings.read_consistency_seconds`` into the
        :class:`datetime.timedelta` value LanceDB expects
-    3. installs a :class:`lancedb.Session` with a bounded index cache
-       and disabled metadata cache so cleaned-up vector indexes release FDs
+    3. installs a :class:`lancedb.Session` with the default index cache
+       disabled and metadata cache disabled so cleaned-up vector and inverted
+       indexes release FDs
 """
 
 from __future__ import annotations
