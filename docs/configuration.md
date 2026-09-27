@@ -97,7 +97,7 @@ everos init --root /data/everos
 | Field | Type | Default | Description |
 |---|---|---|---|
 | `read_consistency_seconds` | float \| null | `null` | Read consistency interval. `null` = no check, `0` = strict, `>0` = eventual. |
-| `index_cache_size_bytes` | int | `16777216` | Upper bound on LanceDB index cache (16 MB default). |
+| `index_cache_size_bytes` | int | `0` | LanceDB index cache size in bytes (`0` disables it to release replaced-index readers). |
 
 ### `[index]`
 

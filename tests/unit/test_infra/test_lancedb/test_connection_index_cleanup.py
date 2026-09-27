@@ -7,7 +7,7 @@ import random
 from datetime import timedelta
 from pathlib import Path
 
-from lancedb.index import IvfFlat
+from lancedb.index import FTS, IvfFlat
 
 from everos.config import LanceDBSettings
 from everos.core.persistence import open_lancedb_connection
@@ -20,7 +20,7 @@ def _deleted_index_fds(root: Path) -> list[str]:
             target = os.readlink(fd)
         except OSError:
             continue
-        if str(root) in target and target.endswith(" (deleted)") and ".idx" in target:
+        if str(root) in target and target.endswith(" (deleted)"):
             targets.append(target)
     return targets
 
@@ -48,6 +48,35 @@ async def test_search_releases_cleaned_vector_files(tmp_path: Path) -> None:
             await table.create_index("vector", replace=True, config=config)
             await table.optimize(cleanup_older_than=timedelta(seconds=0))
             assert not _deleted_index_fds(tmp_path / "vectors")
+    finally:
+        table.close()
+        conn.close()
+
+
+async def test_fts_replace_releases_cleaned_inverted_files(tmp_path: Path) -> None:
+    conn = await open_lancedb_connection(tmp_path / "fts", LanceDBSettings())
+    try:
+        table = await conn.create_table(
+            "documents",
+            data=[
+                {"id": str(i), "body": f"searchable document token{i}"}
+                for i in range(100)
+            ],
+        )
+        await table.create_index("body", config=FTS(with_position=False))
+        for _ in range(3):
+            result = await (
+                table.query()
+                .nearest_to_text("searchable", columns="body")
+                .limit(5)
+                .to_list()
+            )
+            assert len(result) == 5
+            await table.create_index(
+                "body", replace=True, config=FTS(with_position=False)
+            )
+            await table.optimize(cleanup_older_than=timedelta(seconds=0))
+            assert not _deleted_index_fds(tmp_path / "fts")
     finally:
         table.close()
         conn.close()

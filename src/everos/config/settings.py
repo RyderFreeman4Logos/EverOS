@@ -473,53 +473,27 @@ class LanceDBSettings(BaseModel):
 
       LanceDB's own default is ``None`` (unbounded), which on a long-
       running daemon means every new index UUID created by an
-      ``optimize()`` call adds a fresh reader to the cache, and its
-      FDs are never released — they leak monotonically until
-      ``EMFILE`` (os error 24). Verified locally: 30 optimize cycles
-      take FD usage from 0 to ~960 against macOS's default ``ulimit -n``
-      of 256 / Linux's 1024.
+      ``optimize()`` call adds a fresh reader to the cache, retaining FDs
+      until eviction.
 
-      Setting a byte cap turns the cache into a real LRU: when it
-      exceeds the cap, the oldest readers are dropped, Rust ``Drop``
-      runs ``close(fd)``, and the FD pressure resolves itself.
+      A positive byte cap turns the cache into an LRU, but even a bounded
+      cache retains deleted readers until eviction. EverOS defaults to
+      ``0`` (disabled): indexes are opened for each operation and released
+      when their readers go out of scope, preventing replaced FTS
+      ``part_N_invert.lance`` files from retaining deleted FDs.
 
-      Cap → steady-state FD upper bound (measured under 30 add+optimize
-      cycles with the real ``Episode`` schema and 100-query stress):
+      Enable a positive cap only when measured query latency justifies
+      retaining readers and the process has enough FD headroom. Override via
+      ``EVEROS_LANCEDB__INDEX_CACHE_SIZE_BYTES`` only after measuring the
+      resulting FD usage and query latency.
 
-      ===========  =================  ===================
-      cap          FD upper bound     query latency (100q)
-      ===========  =================  ===================
-      ``2 MB``     ~45                ~5 ms
-      ``4 MB``     ~52                ~3 ms
-      ``8 MB``     ~140               ~2.4 ms
-      ``16 MB``    ~290               ~2.3 ms   ← default
-      ``32 MB``    ~630               ~1.4 ms
-      ``unbound``  >960 (leaks)       ~1.3 ms
-      ===========  =================  ===================
-
-      EverOS's measured steady-state working set after a 12 h
-      ``rebuild_indexes`` cycle is ~50-100 readers / 3-6 MB resident
-      (5 tables × ~7 BM25 columns × ~10 part_N entries each), so
-      ``16 MB`` gives ~3× headroom for burst traffic and stale-but-not-
-      yet-evicted readers, while the FD ceiling (~290) stays well below
-      common ulimits (macOS default 256 needs ``ulimit -n 1024`` first;
-      Linux default 1024 is fine out of the box).
-
-      Override via ``EVEROS_LANCEDB__INDEX_CACHE_SIZE_BYTES`` if your
-      working set is much larger (heavier table count or much wider
-      indexes) or if you hit a tighter ``ulimit -n`` (containers / dev
-      boxes).
-
-      Note: the *metadata* cache is disabled in the connection factory.
-      With LanceDB 0.34.0, an unbounded metadata cache retained deleted
-      IVF_FLAT index files despite the 16 MB index-cache bound: eight
-      search/replace/cleanup cycles held 1,3,...,15 deleted .idx FDs.
-      Setting metadata_cache_size_bytes=0 released every deleted index
-      FD in the same experiment while indexed searches still succeeded.
+      Note: the *metadata* cache is also disabled in the connection factory.
+      Both cache settings are required: metadata-cache eviction alone does
+      not release inverted-index readers held by the index cache.
     """
 
     read_consistency_seconds: float | None = None
-    index_cache_size_bytes: int = 16 * 1024 * 1024
+    index_cache_size_bytes: int = 0
     vector_index_min_rows: int = Field(default=2000, ge=1)
     """Rows (with a non-null vector) a table needs before its vector columns
     get an ANN index. Below this a brute-force scan is cheaper than the
