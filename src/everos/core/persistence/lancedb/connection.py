@@ -7,10 +7,8 @@ is a thin wrapper that:
     1. ensures the lancedb root directory exists
     2. converts ``LanceDBSettings.read_consistency_seconds`` into the
        :class:`datetime.timedelta` value LanceDB expects
-    3. installs a capped :class:`lancedb.Session` so the global index
-       cache cannot grow unbounded and exhaust file descriptors
-       (see :attr:`LanceDBSettings.index_cache_size_bytes` for the
-       full rationale)
+    3. installs a :class:`lancedb.Session` with a bounded index cache
+       and disabled metadata cache so cleaned-up vector indexes release FDs
 """
 
 from __future__ import annotations
@@ -48,17 +46,11 @@ async def open_lancedb_connection(
     if lancedb_settings.read_consistency_seconds is not None:
         interval = dt.timedelta(seconds=lancedb_settings.read_consistency_seconds)
 
-    # Bound the index cache so its readers (each one holds the FDs of
-    # an opened ``_indices/<uuid>/...`` directory) get LRU-evicted
-    # rather than leaking. Without this, a long-running daemon's FD
-    # count grows monotonically until ``EMFILE``. The metadata cache
-    # is intentionally left at the lancedb default (unbounded): it
-    # holds parsed in-memory manifests with zero FD pressure, and a
-    # cap there would just thrash. See ``LanceDBSettings`` for the
-    # measurement that picked the default size.
+    # An unbounded metadata cache retains deleted vector-index readers even
+    # with a bounded index cache. Disable it so cleanup releases their FDs.
     session = lancedb.Session(
         index_cache_size_bytes=lancedb_settings.index_cache_size_bytes,
-        metadata_cache_size_bytes=None,
+        metadata_cache_size_bytes=0,
     )
 
     return await lancedb.connect_async(

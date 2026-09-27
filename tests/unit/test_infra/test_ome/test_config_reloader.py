@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -13,7 +14,12 @@ from everos.infra.ome._background.config_reloader import (
     apply_overrides,
 )
 from everos.infra.ome._dispatch.registry import StrategyRegistry
-from everos.infra.ome.config import CounterOverride, StrategyOverride, TomlRoot
+from everos.infra.ome.config import (
+    CounterOverride,
+    OMEConfig,
+    StrategyOverride,
+    TomlRoot,
+)
 from everos.infra.ome.context import StrategyContext
 from everos.infra.ome.decorator import offline_strategy
 from everos.infra.ome.engine import OfflineEngine
@@ -386,6 +392,43 @@ async def test_start_twice_raises(tmp_path: Path) -> None:
             reloader.start()
     finally:
         await reloader.stop()
+
+
+@pytest.mark.asyncio
+async def test_watcher_failure_during_stop_releases_engine_resources(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text("")
+
+    async def failing_awatch(*args: Any, **kwargs: Any) -> Any:
+        if False:
+            yield None
+        raise RuntimeError("watcher failure")
+
+    monkeypatch.setattr(
+        "everos.infra.ome._background.config_reloader.awatch", failing_awatch
+    )
+    config = OMEConfig(
+        jobstore_path=tmp_path / "ome.db",
+        config_path=config_path,
+        config_watch=True,
+        crash_recovery_enabled=False,
+    )
+    first = OfflineEngine(config=config)
+    await first.start()
+    assert first._config_reloader is not None
+    task = first._config_reloader._task
+    assert task is not None
+    with pytest.raises(RuntimeError, match="watcher failure"):
+        await asyncio.shield(task)
+
+    with pytest.raises(RuntimeError, match="watcher failure"):
+        await first.stop()
+
+    second = OfflineEngine(config=config)
+    await second.start()
+    await second.stop()
 
 
 @pytest.mark.asyncio
