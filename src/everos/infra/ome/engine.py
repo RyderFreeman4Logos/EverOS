@@ -454,12 +454,16 @@ class OfflineEngine:
         if self._config_reloader is not None:
             try:
                 await self._config_reloader.stop()
+            except BaseException:
+                logger.exception("ome_partial_start_reloader_stop_failed")
             finally:
                 self._config_reloader = None
         if self._scheduler is not None:
             try:
                 await self.wait_idle(timeout=5.0)
                 self._scheduler.shutdown(wait=False)
+            except BaseException:
+                logger.exception("ome_partial_start_scheduler_shutdown_failed")
             finally:
                 self._scheduler = None
         _ENGINES.pop(self._engine_id, None)
@@ -525,24 +529,36 @@ class OfflineEngine:
         """
         if not self._started:
             return
+        cleanup_error: BaseException | None = None
         if self._config_reloader is not None:
-            await self._config_reloader.stop()
-            self._config_reloader = None
+            try:
+                await self._config_reloader.stop()
+            except BaseException as error:
+                cleanup_error = error
+            finally:
+                self._config_reloader = None
         if self._scheduler is not None:
-            drained = await self.wait_idle(timeout=30.0)
-            if not drained:
-                logger.warning(
-                    "ome_stop_drain_timeout",
-                    engine_id=self._engine_id,
-                    active_runs=self._active_runs,
-                )
-            self._scheduler.shutdown(wait=False)
-            self._scheduler = None
+            try:
+                drained = await self.wait_idle(timeout=30.0)
+                if not drained:
+                    logger.warning(
+                        "ome_stop_drain_timeout",
+                        engine_id=self._engine_id,
+                        active_runs=self._active_runs,
+                    )
+                self._scheduler.shutdown(wait=False)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+            finally:
+                self._scheduler = None
         _ENGINES.pop(self._engine_id, None)
         self._release_lock()
         self._started = False
         self._idle_event = None
         self._active_runs = 0
+        if cleanup_error is not None:
+            raise cleanup_error.with_traceback(cleanup_error.__traceback__)
 
     def _acquire_lock(self) -> None:
         lock_path = Path(str(self._config.jobstore_path) + ".lock")
