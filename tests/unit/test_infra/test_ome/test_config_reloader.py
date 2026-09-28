@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -448,3 +449,78 @@ async def test_start_after_stop_is_allowed(tmp_path: Path) -> None:
     # Must not raise.
     reloader.start()
     await reloader.stop()
+
+
+@pytest.mark.parametrize("watch_errno", [errno.EMFILE, errno.ENOSPC])
+@pytest.mark.asyncio
+async def test_inotify_resource_error_falls_back_to_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watch_errno: int,
+) -> None:
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text("")
+    fallback_started = asyncio.Event()
+    allow_change = asyncio.Event()
+    loaded = asyncio.Queue[None]()
+    calls: list[dict[str, Any]] = []
+
+    async def fake_awatch(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if not kwargs.get("force_polling"):
+            raise OSError(watch_errno, "inotify resources exhausted")
+        fallback_started.set()
+        await allow_change.wait()
+        yield set()
+        await asyncio.Event().wait()
+
+    async def fake_load_once() -> None:
+        await loaded.put(None)
+
+    monkeypatch.setattr(
+        "everos.infra.ome._background.config_reloader.awatch", fake_awatch
+    )
+    reloader = ConfigReloader(
+        config_path=config_path,
+        registry=StrategyRegistry(),
+        engine=MagicMock(spec=OfflineEngine),
+    )
+    monkeypatch.setattr(reloader, "_load_once", fake_load_once)
+
+    reloader.start()
+    await asyncio.wait_for(loaded.get(), timeout=1)
+    await asyncio.wait_for(fallback_started.wait(), timeout=1)
+    await asyncio.wait_for(loaded.get(), timeout=1)
+    allow_change.set()
+    await asyncio.wait_for(loaded.get(), timeout=1)
+    assert calls == [{"debounce": 1600}, {"debounce": 1600, "force_polling": True}]
+    await asyncio.wait_for(reloader.stop(), timeout=1)
+
+
+@pytest.mark.asyncio
+async def test_non_resource_watcher_oserror_still_propagates(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text("")
+
+    async def failing_awatch(*args: Any, **kwargs: Any) -> Any:
+        if False:
+            yield None
+        raise OSError(errno.EACCES, "permission denied")
+
+    monkeypatch.setattr(
+        "everos.infra.ome._background.config_reloader.awatch", failing_awatch
+    )
+    reloader = ConfigReloader(
+        config_path=config_path,
+        registry=StrategyRegistry(),
+        engine=MagicMock(spec=OfflineEngine),
+    )
+    reloader.start()
+    task = reloader._task
+    assert task is not None
+    with pytest.raises(OSError, match="permission denied"):
+        await asyncio.shield(task)
+    with pytest.raises(OSError, match="permission denied"):
+        await reloader.stop()
