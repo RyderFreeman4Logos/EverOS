@@ -23,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from watchfiles import awatch
+from watchfiles._rust_notify import WatchfilesRustInternalError
 
 from everos.core.observability.logging import get_logger
 from everos.infra.ome._dispatch.registry import StrategyRegistry
@@ -36,6 +37,21 @@ if TYPE_CHECKING:
 
 logger = get_logger(__name__)
 _WATCHER_POLLING_ERRNOS = {errno.EMFILE, errno.ENOSPC}
+
+
+def _is_watcher_quota_error(error: BaseException) -> bool:
+    """Return whether watchfiles failed because its watcher quota was exhausted."""
+    if isinstance(error, OSError):
+        return error.errno in _WATCHER_POLLING_ERRNOS
+    if not isinstance(error, WatchfilesRustInternalError):
+        return False
+    cause = error.__cause__
+    if isinstance(cause, OSError):
+        return cause.errno in _WATCHER_POLLING_ERRNOS
+    return any(
+        f"(os error {watch_errno})" in str(error)
+        for watch_errno in _WATCHER_POLLING_ERRNOS
+    )
 
 
 class _SkipAtomicGroupError(Exception):
@@ -251,14 +267,14 @@ class ConfigReloader:
         await self._reload_iteration()
         try:
             await self._watch()
-        except OSError as error:
-            if error.errno not in _WATCHER_POLLING_ERRNOS:
+        except (OSError, WatchfilesRustInternalError) as error:
+            if not _is_watcher_quota_error(error):
                 raise
             logger.warning(
                 "config_watcher_polling_fallback",
                 path=str(self._path),
                 error_type=type(error).__name__,
-                errno=error.errno,
+                errno=getattr(error, "errno", None),
             )
             await self._reload_iteration()
             await self._watch(force_polling=True)

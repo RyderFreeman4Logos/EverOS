@@ -9,6 +9,7 @@ from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from watchfiles._rust_notify import WatchfilesRustInternalError
 
 from everos.infra.ome._background.config_reloader import (
     ConfigReloader,
@@ -451,15 +452,30 @@ async def test_start_after_stop_is_allowed(tmp_path: Path) -> None:
     await reloader.stop()
 
 
-@pytest.mark.parametrize("watch_errno", [errno.EMFILE, errno.ENOSPC])
+@pytest.mark.parametrize(
+    "watch_error",
+    [
+        OSError(errno.EMFILE, "inotify resources exhausted"),
+        OSError(errno.ENOSPC, "inotify resources exhausted"),
+        WatchfilesRustInternalError(
+            "Error creating recommended watcher: Too many open files (os error 24)"
+        ),
+        WatchfilesRustInternalError(
+            "Error creating recommended watcher: No space left on device (os error 28)"
+        ),
+    ],
+)
 @pytest.mark.asyncio
 async def test_inotify_resource_error_falls_back_to_polling(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    watch_errno: int,
+    watch_error: BaseException,
 ) -> None:
     config_path = tmp_path / "ome.toml"
     config_path.write_text("")
+    if isinstance(watch_error, WatchfilesRustInternalError):
+        assert getattr(watch_error, "errno", None) is None
+        assert watch_error.__cause__ is None
     fallback_started = asyncio.Event()
     allow_change = asyncio.Event()
     loaded = asyncio.Queue[None]()
@@ -468,7 +484,7 @@ async def test_inotify_resource_error_falls_back_to_polling(
     async def fake_awatch(*args: Any, **kwargs: Any) -> Any:
         calls.append(kwargs)
         if not kwargs.get("force_polling"):
-            raise OSError(watch_errno, "inotify resources exhausted")
+            raise watch_error
         fallback_started.set()
         await allow_change.wait()
         yield set()
@@ -497,9 +513,20 @@ async def test_inotify_resource_error_falls_back_to_polling(
     await asyncio.wait_for(reloader.stop(), timeout=1)
 
 
+@pytest.mark.parametrize(
+    "watch_error",
+    [
+        OSError(errno.EACCES, "permission denied"),
+        WatchfilesRustInternalError(
+            "Error creating recommended watcher: Permission denied (os error 13)"
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_non_resource_watcher_oserror_still_propagates(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+async def test_non_resource_watcher_error_still_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watch_error: BaseException,
 ) -> None:
     config_path = tmp_path / "ome.toml"
     config_path.write_text("")
@@ -507,7 +534,7 @@ async def test_non_resource_watcher_oserror_still_propagates(
     async def failing_awatch(*args: Any, **kwargs: Any) -> Any:
         if False:
             yield None
-        raise OSError(errno.EACCES, "permission denied")
+        raise watch_error
 
     monkeypatch.setattr(
         "everos.infra.ome._background.config_reloader.awatch", failing_awatch
@@ -520,7 +547,7 @@ async def test_non_resource_watcher_oserror_still_propagates(
     reloader.start()
     task = reloader._task
     assert task is not None
-    with pytest.raises(OSError, match="permission denied"):
+    with pytest.raises(type(watch_error), match=r"(?i)permission denied"):
         await asyncio.shield(task)
-    with pytest.raises(OSError, match="permission denied"):
+    with pytest.raises(type(watch_error), match=r"(?i)permission denied"):
         await reloader.stop()
