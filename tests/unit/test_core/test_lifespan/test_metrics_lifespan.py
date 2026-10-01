@@ -48,30 +48,20 @@ def test_metrics_start_before_tracing_lifespan() -> None:
     assert MetricsLifespanProvider().order < TracingLifespanProvider().order
 
 
-async def test_opt_in_exposes_numeric_tracemalloc_gauges(
+async def test_opt_in_observes_existing_tracemalloc_without_owning_it(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Opt-in starts one-frame tracing and exposes byte gauges on scrape."""
+    """Opt-in observes existing tracing and exposes byte gauges on scrape."""
     monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
     registry = CollectorRegistry()
     set_metrics_registry(registry)
-    tracing = False
-    started: list[int] = []
-    stopped: list[bool] = []
-
-    def start(nframe: int) -> None:
-        nonlocal tracing
-        started.append(nframe)
-        tracing = True
-
-    def stop() -> None:
-        nonlocal tracing
-        stopped.append(tracing)
-        tracing = False
-
-    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: tracing)
-    monkeypatch.setattr(tracemalloc, "start", start)
-    monkeypatch.setattr(tracemalloc, "stop", stop)
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
+    monkeypatch.setattr(
+        tracemalloc, "start", lambda *_args: pytest.fail("must not start tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc, "stop", lambda: pytest.fail("must not stop tracing")
+    )
     monkeypatch.setattr(tracemalloc, "get_traced_memory", lambda: (1234, 5678))
 
     provider = MetricsLifespanProvider()
@@ -80,9 +70,7 @@ async def test_opt_in_exposes_numeric_tracemalloc_gauges(
         exposition = generate_metrics_response().decode()
         assert "everos_python_traced_memory_bytes 1234.0" in exposition
         assert "everos_python_traced_memory_peak_bytes 5678.0" in exposition
-        assert started == [1]
         await provider.shutdown(FastAPI())
-        assert stopped == [True]
     finally:
         await provider.shutdown(FastAPI())
         reset_metrics_registry()
@@ -91,22 +79,16 @@ async def test_opt_in_exposes_numeric_tracemalloc_gauges(
 async def test_opt_in_default_registry_supports_sequential_lifespans(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A closed provider releases its collectors for the next app lifespan."""
+    """Closed providers release collectors for the next app lifespan."""
     monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
     set_metrics_registry(REGISTRY)
-    tracing = False
-
-    def start(_nframe: int) -> None:
-        nonlocal tracing
-        tracing = True
-
-    def stop() -> None:
-        nonlocal tracing
-        tracing = False
-
-    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: tracing)
-    monkeypatch.setattr(tracemalloc, "start", start)
-    monkeypatch.setattr(tracemalloc, "stop", stop)
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
+    monkeypatch.setattr(
+        tracemalloc, "start", lambda *_args: pytest.fail("must not start tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc, "stop", lambda: pytest.fail("must not stop tracing")
+    )
     monkeypatch.setattr(tracemalloc, "get_traced_memory", lambda: (123, 456))
 
     try:
@@ -116,7 +98,6 @@ async def test_opt_in_default_registry_supports_sequential_lifespans(
             exposition = generate_metrics_response().decode()
             assert "everos_python_traced_memory_bytes 123.0" in exposition
             await provider.shutdown(FastAPI())
-            assert not tracing
         assert "everos_python_traced_memory_bytes" not in (
             generate_metrics_response().decode()
         )
@@ -127,20 +108,11 @@ async def test_opt_in_default_registry_supports_sequential_lifespans(
 async def test_opt_in_partial_startup_cleanup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A failed setup releases its own collectors and tracer for a retry."""
+    """A failed setup releases only its collectors for a retry."""
     monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
     set_metrics_registry(REGISTRY)
-    tracing = False
     set_function = metrics_lifespan_module.Gauge.set_function
     calls = 0
-
-    def start(_nframe: int) -> None:
-        nonlocal tracing
-        tracing = True
-
-    def stop() -> None:
-        nonlocal tracing
-        tracing = False
 
     def fail_peak_gauge(
         self: metrics_lifespan_module.Gauge, function: Callable[[], float]
@@ -151,9 +123,13 @@ async def test_opt_in_partial_startup_cleanup(
             raise RuntimeError("injected gauge setup failure")
         set_function(self, function)
 
-    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: tracing)
-    monkeypatch.setattr(tracemalloc, "start", start)
-    monkeypatch.setattr(tracemalloc, "stop", stop)
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
+    monkeypatch.setattr(
+        tracemalloc, "start", lambda *_args: pytest.fail("must not start tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc, "stop", lambda: pytest.fail("must not stop tracing")
+    )
     monkeypatch.setattr(tracemalloc, "get_traced_memory", lambda: (123, 456))
     monkeypatch.setattr(metrics_lifespan_module.Gauge, "set_function", fail_peak_gauge)
 
@@ -161,119 +137,133 @@ async def test_opt_in_partial_startup_cleanup(
         provider = MetricsLifespanProvider()
         with pytest.raises(RuntimeError, match="injected gauge setup failure"):
             await provider.startup(FastAPI())
-        assert not tracing
         assert "everos_python_traced_memory" not in (
             generate_metrics_response().decode()
         )
         await provider.startup(FastAPI())
-        assert tracing
         await provider.shutdown(FastAPI())
-        assert not tracing
     finally:
         reset_metrics_registry()
 
 
-async def test_failed_concurrent_startup_preserves_active_provider(
+async def test_same_instance_startup_is_idempotent(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A duplicate startup failure cannot stop tracing or remove live collectors."""
+    """Repeated startup on one provider leaves its collectors registered once."""
     monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
     set_metrics_registry(REGISTRY)
-    tracing = False
-
-    def start(_nframe: int) -> None:
-        nonlocal tracing
-        tracing = True
-
-    def stop() -> None:
-        nonlocal tracing
-        tracing = False
-
-    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: tracing)
-    monkeypatch.setattr(tracemalloc, "start", start)
-    monkeypatch.setattr(tracemalloc, "stop", stop)
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
+    monkeypatch.setattr(
+        tracemalloc, "start", lambda *_args: pytest.fail("must not start tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc, "stop", lambda: pytest.fail("must not stop tracing")
+    )
     monkeypatch.setattr(tracemalloc, "get_traced_memory", lambda: (123, 456))
 
-    first = MetricsLifespanProvider()
+    provider = MetricsLifespanProvider()
     try:
-        await first.startup(FastAPI())
-        with pytest.raises(ValueError, match="Duplicated timeseries"):
-            await MetricsLifespanProvider().startup(FastAPI())
-        assert tracing
+        await provider.startup(FastAPI())
+        assert await provider.startup(FastAPI()) is REGISTRY
         exposition = generate_metrics_response().decode()
         assert "everos_python_traced_memory_bytes 123.0" in exposition
         assert "everos_python_traced_memory_peak_bytes 456.0" in exposition
-        await first.shutdown(FastAPI())
-        assert not tracing
+        await provider.shutdown(FastAPI())
     finally:
-        await first.shutdown(FastAPI())
+        await provider.shutdown(FastAPI())
         reset_metrics_registry()
 
 
-async def test_opt_in_tracemalloc_stops_at_deadline(
+async def test_opt_in_sampling_expires_without_stopping_tracer(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The lifetime timer stops tracing even without another metrics scrape."""
+    """The sample freezes at expiry while external tracing remains untouched."""
     monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
     monkeypatch.setattr(
         metrics_lifespan_module, "_TRACEMALLOC_WINDOW_SECONDS", 0.01, raising=False
     )
     registry = CollectorRegistry()
     set_metrics_registry(registry)
-    tracing = False
-    stopped = asyncio.Event()
-
-    def start(nframe: int) -> None:
-        nonlocal tracing
-        assert nframe == 1
-        tracing = True
-
-    def stop() -> None:
-        nonlocal tracing
-        tracing = False
-        stopped.set()
-
-    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: tracing)
-    monkeypatch.setattr(tracemalloc, "start", start)
-    monkeypatch.setattr(tracemalloc, "stop", stop)
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
+    monkeypatch.setattr(
+        tracemalloc, "start", lambda *_args: pytest.fail("must not start tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc, "stop", lambda: pytest.fail("must not stop tracing")
+    )
     monkeypatch.setattr(tracemalloc, "get_traced_memory", lambda: (1, 2))
 
     provider = MetricsLifespanProvider()
     try:
         await provider.startup(FastAPI())
-        await asyncio.wait_for(stopped.wait(), timeout=1)
-        assert not tracing
+        await asyncio.sleep(0.02)
+        exposition = generate_metrics_response().decode()
+        assert "everos_python_traced_memory_bytes 1.0" in exposition
     finally:
         await provider.shutdown(FastAPI())
         reset_metrics_registry()
 
 
-async def test_preexisting_tracemalloc_is_not_stopped(
+async def test_external_tracemalloc_restart_is_never_stopped(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Use existing tracing without stopping it."""
+    """Shutdown cannot stop a tracer that another owner restarted."""
     monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
-    registry = CollectorRegistry()
-    set_metrics_registry(registry)
-    stopped: list[bool] = []
+    set_metrics_registry(CollectorRegistry())
+    tracing = True
+    calls: list[str] = []
 
-    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: True)
-    monkeypatch.setattr(
-        tracemalloc, "start", lambda _nframe: pytest.fail("already tracing")
-    )
-    monkeypatch.setattr(tracemalloc, "stop", lambda: stopped.append(True))
+    def is_tracing() -> bool:
+        return tracing
+
+    def record_start(*_args: int) -> None:
+        calls.append("start")
+
+    def record_stop() -> None:
+        calls.append("stop")
+
+    monkeypatch.setattr(tracemalloc, "is_tracing", is_tracing)
+    monkeypatch.setattr(tracemalloc, "start", record_start)
+    monkeypatch.setattr(tracemalloc, "stop", record_stop)
     monkeypatch.setattr(tracemalloc, "get_traced_memory", lambda: (77, 88))
-
     provider = MetricsLifespanProvider()
     try:
         await provider.startup(FastAPI())
-        exposition = generate_metrics_response().decode()
-        assert "everos_python_traced_memory_bytes 77.0" in exposition
-        assert "everos_python_traced_memory_peak_bytes 88.0" in exposition
+        tracing = False
+        tracing = True
         await provider.shutdown(FastAPI())
-        assert stopped == []
+        assert tracing
+        assert calls == []
     finally:
+        reset_metrics_registry()
+
+
+async def test_opt_in_without_tracer_registers_no_diagnostic_gauges(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Opt-in alone does not start tracing or publish empty measurements."""
+    monkeypatch.setenv("EVEROS_TRACEMALLOC", "1")
+    set_metrics_registry(CollectorRegistry())
+    monkeypatch.setattr(tracemalloc, "is_tracing", lambda: False)
+    monkeypatch.setattr(
+        tracemalloc, "start", lambda *_args: pytest.fail("must not start tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc, "stop", lambda: pytest.fail("must not stop tracing")
+    )
+    monkeypatch.setattr(
+        tracemalloc,
+        "get_traced_memory",
+        lambda: pytest.fail("inactive tracer must not be sampled"),
+    )
+    provider = MetricsLifespanProvider()
+    try:
+        await provider.startup(FastAPI())
+        assert "everos_python_traced_memory" not in (
+            generate_metrics_response().decode()
+        )
         await provider.shutdown(FastAPI())
+    finally:
         reset_metrics_registry()
 
 

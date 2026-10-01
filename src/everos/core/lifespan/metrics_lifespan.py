@@ -1,9 +1,11 @@
 """Metrics lifespan provider.
 
 Confirms the metrics registry is ready and logs that the ``/metrics`` HTTP
-endpoint is mounted on the main API. Setting ``EVEROS_TRACEMALLOC=1`` opts into
-a 20-minute sample; EverOS starts a one-frame tracer only when needed and
-exposes two numeric gauges.
+endpoint is mounted on the main API. ``EVEROS_TRACEMALLOC=1`` observes an
+already-enabled tracer for at most 20 minutes; it never controls process-global
+tracemalloc. Start Python with ``PYTHONTRACEMALLOC=1`` to enable tracing, which
+adds overhead for the process lifetime. The sampling window limits only these
+gauges, not tracing; operators must end a live trial by restarting the process.
 """
 
 from __future__ import annotations
@@ -33,17 +35,14 @@ class _TracemallocMetrics:
     def __init__(
         self,
         tracemalloc: ModuleType,
-        owns_tracing: bool,
         window_seconds: float,
     ) -> None:
         self._tracemalloc = tracemalloc
-        self._owns_tracing = owns_tracing
         self._loop = asyncio.get_running_loop()
         self._deadline = self._loop.time() + window_seconds
         self._closed = False
         self._current_bytes = 0
         self._peak_bytes = 0
-        # Stop tracing even if metrics scraping pauses for the whole window.
         self._timer = self._loop.call_later(window_seconds, self.close)
 
     def current_bytes(self) -> float:
@@ -74,8 +73,6 @@ class _TracemallocMetrics:
         self._snapshot()
         self._closed = True
         self._timer.cancel()
-        if self._owns_tracing and self._tracemalloc.is_tracing():
-            self._tracemalloc.stop()
 
 
 class MetricsLifespanProvider(LifespanProvider):
@@ -88,37 +85,37 @@ class MetricsLifespanProvider(LifespanProvider):
         self._tracemalloc_gauges: list[Gauge] = []
 
     async def startup(self, app: FastAPI) -> Any:
+        if self._tracemalloc_registry is not None:
+            return self._tracemalloc_registry
+
         registry = get_metrics_registry()
         if os.environ.get(_TRACEMALLOC_OPT_IN_ENV) == "1":
             import tracemalloc
 
-            owns_tracing = not tracemalloc.is_tracing()
-            self._tracemalloc_registry = registry
-            try:
-                current_gauge = Gauge(
-                    "everos_python_traced_memory_bytes",
-                    "Current Python traced allocation size in bytes; frozen at expiry.",
-                )
-                self._tracemalloc_gauges.append(current_gauge)
-                peak_gauge = Gauge(
-                    "everos_python_traced_memory_peak_bytes",
-                    "Peak Python traced allocation size in bytes; frozen at expiry.",
-                )
-                self._tracemalloc_gauges.append(peak_gauge)
-                if owns_tracing:
-                    tracemalloc.start(1)
-                self._tracemalloc_metrics = _TracemallocMetrics(
-                    tracemalloc,
-                    owns_tracing,
-                    _TRACEMALLOC_WINDOW_SECONDS,
-                )
-                current_gauge.set_function(self._tracemalloc_metrics.current_bytes)
-                peak_gauge.set_function(self._tracemalloc_metrics.peak_bytes)
-            except BaseException:
-                self._release_tracemalloc_metrics()
-                if owns_tracing and tracemalloc.is_tracing():
-                    tracemalloc.stop()
-                raise
+            if tracemalloc.is_tracing():
+                self._tracemalloc_registry = registry
+                try:
+                    current_gauge = Gauge(
+                        "everos_python_traced_memory_bytes",
+                        "Current Python traced allocation size in bytes; "
+                        "frozen at expiry.",
+                    )
+                    self._tracemalloc_gauges.append(current_gauge)
+                    peak_gauge = Gauge(
+                        "everos_python_traced_memory_peak_bytes",
+                        "Peak Python traced allocation size in bytes; "
+                        "frozen at expiry.",
+                    )
+                    self._tracemalloc_gauges.append(peak_gauge)
+                    self._tracemalloc_metrics = _TracemallocMetrics(
+                        tracemalloc,
+                        _TRACEMALLOC_WINDOW_SECONDS,
+                    )
+                    current_gauge.set_function(self._tracemalloc_metrics.current_bytes)
+                    peak_gauge.set_function(self._tracemalloc_metrics.peak_bytes)
+                except BaseException:
+                    self._release_tracemalloc_metrics()
+                    raise
         logger.info("metrics_registry_ready", endpoint="/metrics")
         return registry
 
