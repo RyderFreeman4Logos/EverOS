@@ -1,13 +1,13 @@
 """Gauge wrapper around ``prometheus_client.Gauge``.
 
-Async auto-refresh is intentionally not included in v0.1; subclass
-:class:`Gauge` and call :meth:`set` from your own scheduling logic when
-needed.
+Async auto-refresh is intentionally not included in v0.1; use
+:meth:`set_function` for synchronous scrape-time values or call :meth:`set`
+from your own scheduling logic.
 """
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from typing import Any
 
 from prometheus_client import Gauge as PromGauge
@@ -42,6 +42,10 @@ class Gauge:
 
     def set(self, value: float) -> None:
         self._gauge.set(value)
+
+    def set_function(self, function: Callable[[], float]) -> None:
+        """Compute the gauge value when the metrics registry is collected."""
+        self._gauge.set_function(function)
 
     def inc(self, amount: float = 1.0) -> None:
         self._gauge.inc(amount)
