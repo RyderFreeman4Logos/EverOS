@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
 import pytest
+from watchfiles._rust_notify import WatchfilesRustInternalError
 
 from everos.infra.ome._background.config_reloader import (
     ConfigReloader,
@@ -448,3 +450,104 @@ async def test_start_after_stop_is_allowed(tmp_path: Path) -> None:
     # Must not raise.
     reloader.start()
     await reloader.stop()
+
+
+@pytest.mark.parametrize(
+    "watch_error",
+    [
+        OSError(errno.EMFILE, "inotify resources exhausted"),
+        OSError(errno.ENOSPC, "inotify resources exhausted"),
+        WatchfilesRustInternalError(
+            "Error creating recommended watcher: Too many open files (os error 24)"
+        ),
+        WatchfilesRustInternalError(
+            "Error creating recommended watcher: No space left on device (os error 28)"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_inotify_resource_error_falls_back_to_polling(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watch_error: BaseException,
+) -> None:
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text("")
+    if isinstance(watch_error, WatchfilesRustInternalError):
+        assert getattr(watch_error, "errno", None) is None
+        assert watch_error.__cause__ is None
+    fallback_started = asyncio.Event()
+    allow_change = asyncio.Event()
+    loaded = asyncio.Queue[None]()
+    calls: list[dict[str, Any]] = []
+
+    async def fake_awatch(*args: Any, **kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if not kwargs.get("force_polling"):
+            raise watch_error
+        fallback_started.set()
+        await allow_change.wait()
+        yield set()
+        await asyncio.Event().wait()
+
+    async def fake_load_once() -> None:
+        await loaded.put(None)
+
+    monkeypatch.setattr(
+        "everos.infra.ome._background.config_reloader.awatch", fake_awatch
+    )
+    reloader = ConfigReloader(
+        config_path=config_path,
+        registry=StrategyRegistry(),
+        engine=MagicMock(spec=OfflineEngine),
+    )
+    monkeypatch.setattr(reloader, "_load_once", fake_load_once)
+
+    reloader.start()
+    await asyncio.wait_for(loaded.get(), timeout=1)
+    await asyncio.wait_for(fallback_started.wait(), timeout=1)
+    await asyncio.wait_for(loaded.get(), timeout=1)
+    allow_change.set()
+    await asyncio.wait_for(loaded.get(), timeout=1)
+    assert calls == [{"debounce": 1600}, {"debounce": 1600, "force_polling": True}]
+    await asyncio.wait_for(reloader.stop(), timeout=1)
+
+
+@pytest.mark.parametrize(
+    "watch_error",
+    [
+        OSError(errno.EACCES, "permission denied"),
+        WatchfilesRustInternalError(
+            "Error creating recommended watcher: Permission denied (os error 13)"
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_non_resource_watcher_error_still_propagates(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    watch_error: BaseException,
+) -> None:
+    config_path = tmp_path / "ome.toml"
+    config_path.write_text("")
+
+    async def failing_awatch(*args: Any, **kwargs: Any) -> Any:
+        if False:
+            yield None
+        raise watch_error
+
+    monkeypatch.setattr(
+        "everos.infra.ome._background.config_reloader.awatch", failing_awatch
+    )
+    reloader = ConfigReloader(
+        config_path=config_path,
+        registry=StrategyRegistry(),
+        engine=MagicMock(spec=OfflineEngine),
+    )
+    reloader.start()
+    task = reloader._task
+    assert task is not None
+    with pytest.raises(type(watch_error), match=r"(?i)permission denied"):
+        await asyncio.shield(task)
+    with pytest.raises(type(watch_error), match=r"(?i)permission denied"):
+        await reloader.stop()

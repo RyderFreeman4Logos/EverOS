@@ -14,6 +14,7 @@ form one atomic group that fully rolls back on any failure inside it.
 from __future__ import annotations
 
 import asyncio
+import errno
 import tomllib
 from contextlib import suppress
 from dataclasses import replace
@@ -22,6 +23,7 @@ from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from watchfiles import awatch
+from watchfiles._rust_notify import WatchfilesRustInternalError
 
 from everos.core.observability.logging import get_logger
 from everos.infra.ome._dispatch.registry import StrategyRegistry
@@ -34,6 +36,22 @@ if TYPE_CHECKING:
     from everos.infra.ome.engine import OfflineEngine
 
 logger = get_logger(__name__)
+_WATCHER_POLLING_ERRNOS = {errno.EMFILE, errno.ENOSPC}
+
+
+def _is_watcher_quota_error(error: BaseException) -> bool:
+    """Return whether watchfiles failed because its watcher quota was exhausted."""
+    if isinstance(error, OSError):
+        return error.errno in _WATCHER_POLLING_ERRNOS
+    if not isinstance(error, WatchfilesRustInternalError):
+        return False
+    cause = error.__cause__
+    if isinstance(cause, OSError):
+        return cause.errno in _WATCHER_POLLING_ERRNOS
+    return any(
+        f"(os error {watch_errno})" in str(error)
+        for watch_errno in _WATCHER_POLLING_ERRNOS
+    )
 
 
 class _SkipAtomicGroupError(Exception):
@@ -224,17 +242,42 @@ class ConfigReloader:
                 await self._task
             self._task = None
 
-    async def _loop(self) -> None:
-        """Initial load + per-FS-change reload; survives single-iteration failures."""
+    async def _reload_iteration(self) -> None:
+        """Apply one reload while keeping the watcher loop alive."""
         try:
             await self._load_once()
         except Exception:
             logger.exception("config_reload_iteration_failed")
-        async for _changes in awatch(self._path, debounce=self._debounce_ms):
-            try:
-                await self._load_once()
-            except Exception:
-                logger.exception("config_reload_iteration_failed")
+
+    async def _watch(self, *, force_polling: bool = False) -> None:
+        """Watch for changes, optionally using watchfiles' polling backend."""
+        if force_polling:
+            watcher = awatch(
+                self._path,
+                debounce=self._debounce_ms,
+                force_polling=True,
+            )
+        else:
+            watcher = awatch(self._path, debounce=self._debounce_ms)
+        async for _changes in watcher:
+            await self._reload_iteration()
+
+    async def _loop(self) -> None:
+        """Initial load + per-FS-change reload; survives single-iteration failures."""
+        await self._reload_iteration()
+        try:
+            await self._watch()
+        except (OSError, WatchfilesRustInternalError) as error:
+            if not _is_watcher_quota_error(error):
+                raise
+            logger.warning(
+                "config_watcher_polling_fallback",
+                path=str(self._path),
+                error_type=type(error).__name__,
+                errno=getattr(error, "errno", None),
+            )
+            await self._reload_iteration()
+            await self._watch(force_polling=True)
 
     async def _load_once(self) -> None:
         """Read TOML off the loop, parse + validate, apply overrides."""
