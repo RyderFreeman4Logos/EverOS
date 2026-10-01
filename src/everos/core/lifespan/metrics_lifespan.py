@@ -14,6 +14,7 @@ from types import ModuleType
 from typing import Any
 
 from fastapi import FastAPI
+from prometheus_client import CollectorRegistry
 
 from everos.core.observability.logging import get_logger
 from everos.core.observability.metrics import Gauge, get_metrics_registry
@@ -83,34 +84,54 @@ class MetricsLifespanProvider(LifespanProvider):
     def __init__(self, order: int = 0) -> None:
         super().__init__(name="metrics", order=order)
         self._tracemalloc_metrics: _TracemallocMetrics | None = None
+        self._tracemalloc_registry: CollectorRegistry | None = None
+        self._tracemalloc_gauges: list[Gauge] = []
 
     async def startup(self, app: FastAPI) -> Any:
         registry = get_metrics_registry()
         if os.environ.get(_TRACEMALLOC_OPT_IN_ENV) == "1":
             import tracemalloc
 
-            current_gauge = Gauge(
-                "everos_python_traced_memory_bytes",
-                "Current Python traced allocation size in bytes; frozen at expiry.",
-            )
-            peak_gauge = Gauge(
-                "everos_python_traced_memory_peak_bytes",
-                "Peak Python traced allocation size in bytes; frozen at expiry.",
-            )
             owns_tracing = not tracemalloc.is_tracing()
-            if owns_tracing:
-                tracemalloc.start(1)
-            self._tracemalloc_metrics = _TracemallocMetrics(
-                tracemalloc,
-                owns_tracing,
-                _TRACEMALLOC_WINDOW_SECONDS,
-            )
-            current_gauge.set_function(self._tracemalloc_metrics.current_bytes)
-            peak_gauge.set_function(self._tracemalloc_metrics.peak_bytes)
+            self._tracemalloc_registry = registry
+            try:
+                current_gauge = Gauge(
+                    "everos_python_traced_memory_bytes",
+                    "Current Python traced allocation size in bytes; frozen at expiry.",
+                )
+                self._tracemalloc_gauges.append(current_gauge)
+                peak_gauge = Gauge(
+                    "everos_python_traced_memory_peak_bytes",
+                    "Peak Python traced allocation size in bytes; frozen at expiry.",
+                )
+                self._tracemalloc_gauges.append(peak_gauge)
+                if owns_tracing:
+                    tracemalloc.start(1)
+                self._tracemalloc_metrics = _TracemallocMetrics(
+                    tracemalloc,
+                    owns_tracing,
+                    _TRACEMALLOC_WINDOW_SECONDS,
+                )
+                current_gauge.set_function(self._tracemalloc_metrics.current_bytes)
+                peak_gauge.set_function(self._tracemalloc_metrics.peak_bytes)
+            except BaseException:
+                self._release_tracemalloc_metrics()
+                if owns_tracing and tracemalloc.is_tracing():
+                    tracemalloc.stop()
+                raise
         logger.info("metrics_registry_ready", endpoint="/metrics")
         return registry
 
     async def shutdown(self, app: FastAPI) -> None:
+        self._release_tracemalloc_metrics()
+        logger.info("metrics_lifespan_shutdown")
+
+    def _release_tracemalloc_metrics(self) -> None:
         if self._tracemalloc_metrics is not None:
             self._tracemalloc_metrics.close()
-        logger.info("metrics_lifespan_shutdown")
+            self._tracemalloc_metrics = None
+        if self._tracemalloc_registry is not None:
+            for gauge in self._tracemalloc_gauges:
+                self._tracemalloc_registry.unregister(gauge._gauge)
+        self._tracemalloc_gauges.clear()
+        self._tracemalloc_registry = None
